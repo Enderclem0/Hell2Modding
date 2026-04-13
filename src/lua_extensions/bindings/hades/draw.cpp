@@ -1,19 +1,28 @@
 /// @file draw.cpp
 /// @brief Draw-call control for 3D model entries.
 ///
-/// Hooks sgg::DrawManager's four draw functions to suppress draw calls
-/// for entries whose HashGuid is in a hidden set.  Provides the Lua
-/// binding `rom.data.set_draw_visible(entry_name, visible)`.
+/// Provides two Lua APIs for controlling 3D model rendering at runtime:
 ///
-/// Three functions (DoDraw3D, DoDrawShadow3D, DoDraw3DThumbnail) share
-/// the PDB signature `static void(const vector<RenderMesh*>&, uint, int, HashGuid)`
-/// and are handled with standard detour hooks on param4.
+///   rom.data.set_draw_visible(entry_name, visible)
+///     Suppress or restore draw calls for a model entry by HashGuid.
+///
+///   rom.data.set_draw_remap(source_entry, target_entry)
+///   rom.data.clear_draw_remap(source_entry)
+///     Redirect a model entry to draw a different mModelData entry.
+///     Enables outfit/variant switching without reload.
+///
+///   rom.data.add_model_entry(entry_name)
+///     Register a custom entry name to be loaded during startup.
+///     Must be called during plugin init, before model loading.
+///
+/// Three draw functions (DoDraw3D, DoDrawShadow3D, DoDraw3DThumbnail)
+/// share the PDB signature `static void(const vector<RenderMesh*>&,
+/// uint, int, HashGuid)` and are handled with standard detour hooks.
 ///
 /// DoDrawShadowCast3D has a different signature (no HashGuid param).
-/// The entry hash IS present in the draw entry at [r10+0x28] but the
-/// dispatch code skips reading it for the shadow path.  SafetyHook
-/// mid-hooks fail in this dispatch area, so we patch the bytes directly
-/// with VirtualProtect + a hand-assembled code cave.
+/// A manual code cave patched into the draw dispatch handles both
+/// visibility and remapping for all four draw functions by intercepting
+/// the draw entry's hash at [r10+0x28] before the variant branch.
 
 #include "draw.hpp"
 
@@ -32,47 +41,122 @@ namespace lua::hades::draw
 
 	static std::shared_mutex g_mutex;
 	static std::unordered_set<unsigned int> g_hidden_entries;
+	static std::unordered_map<unsigned int, unsigned int> g_remap; // original → variant
 
 	// Fast-path flag for the code cave — avoids the function-call overhead
-	// on every draw entry when nothing is hidden.
+	// on every draw entry when nothing is active (hidden or remapped).
 	static volatile uint8_t g_any_active = 0;
 
+	static void update_active_flag()
+	{
+		g_any_active = (g_hidden_entries.empty() && g_remap.empty()) ? 0 : 1;
+	}
+
 	// Called from the code cave via function pointer.
-	static bool is_hash_hidden(uint32_t hash)
+	// Returns: 0 = pass through, 1 = hidden (skip), 2 = remapped (*out_hash set)
+	static int check_draw_entry(uint32_t hash, uint32_t* out_hash)
 	{
 		std::shared_lock l(g_mutex);
-		return g_hidden_entries.count(hash) > 0;
+		auto it = g_remap.find(hash);
+		if (it != g_remap.end())
+		{
+			*out_hash = it->second;
+			return 2;
+		}
+		if (g_hidden_entries.count(hash))
+			return 1;
+		return 0;
+	}
+
+	// Lua API: Function
+	// Table: data
+	// Name: load_model_entry
+	// Param: entry_name: string: Entry name to load into mModelData.
+	// Calls sgg::Granny3D::LoadModelData directly.  The entry's GPK must
+	// already be registered via `add_granny_file`.
+	//
+	// IMPORTANT: Must be called AFTER LoadAllModelAndAnimationData completes
+	// (e.g. from rom.on_import.post("Main.lua")) but BEFORE the first frame.
+	// Calling during plugin init corrupts weapon models; calling mid-session
+	// crashes App::UpdateAndDraw.
+	//
+	// **Example Usage:**
+	// ```lua
+	// rom.on_import.post(function(script_name)
+	//     if script_name == "Main.lua" then
+	//         rom.data.add_granny_file("MyVariant.gpk", path)
+	//         rom.data.load_model_entry("MyVariant")
+	//     end
+	// end)
+	// ```
+	// Intern a string into the game's HashGuid system.
+	// Unlike Lookup (which only finds existing strings), StringIntern
+	// CREATES a hash entry for new strings.  Required for custom variant
+	// names that the game has never seen.
+	static sgg::HashGuid intern_string(const std::string& name)
+	{
+		static auto StringIntern = big::hades2_symbol_to_address["sgg::HashGuid::StringIntern"]
+		    .as_func<uint32_t(const char*, int)>();
+
+		sgg::HashGuid guid{};
+		if (StringIntern)
+			guid.mId = StringIntern(name.c_str(), static_cast<int>(name.size()));
+		return guid;
+	}
+
+	static void load_model_entry(const std::string& entry_name)
+	{
+		static auto LoadModelData_fn = big::hades2_symbol_to_address["sgg::Granny3D::LoadModelData"]
+		    .as_func<void(sgg::HashGuid)>();
+
+		if (!LoadModelData_fn)
+		{
+			LOG(ERROR) << "draw: LoadModelData symbol not found";
+			return;
+		}
+
+		sgg::HashGuid guid = intern_string(entry_name);
+		if (guid.mId == 0)
+		{
+			LOG(WARNING) << "draw: intern returned 0 for '" << entry_name << "'";
+			return;
+		}
+
+		LoadModelData_fn(guid);
+		LOG(INFO) << "draw: loaded " << entry_name << " (hash=" << guid.mId << ")";
 	}
 
 	// ─── Detour hooks (DoDraw3D, DoDrawShadow3D, DoDraw3DThumbnail) ──
 
+	// Helper: apply remap + hidden check on a hash.  Returns true if the
+	// entry should be drawn (possibly with a modified hash).
+	static bool apply_draw_filter(sgg::HashGuid& hash)
+	{
+		std::shared_lock l(g_mutex);
+		auto it = g_remap.find(hash.mId);
+		if (it != g_remap.end())
+			hash.mId = it->second;
+		return g_hidden_entries.count(hash.mId) == 0;
+	}
+
 	static void hook_DoDraw3D(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
-		{
-			std::shared_lock l(g_mutex);
-			if (g_hidden_entries.count(hash.mId))
-				return;
-		}
+		if (!apply_draw_filter(hash))
+			return;
 		big::g_hooking->get_original<hook_DoDraw3D>()(vec_ref, index, param, hash);
 	}
 
 	static void hook_DoDrawShadow3D(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
-		{
-			std::shared_lock l(g_mutex);
-			if (g_hidden_entries.count(hash.mId))
-				return;
-		}
+		if (!apply_draw_filter(hash))
+			return;
 		big::g_hooking->get_original<hook_DoDrawShadow3D>()(vec_ref, index, param, hash);
 	}
 
 	static void hook_DoDraw3DThumbnail(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
-		{
-			std::shared_lock l(g_mutex);
-			if (g_hidden_entries.count(hash.mId))
-				return;
-		}
+		if (!apply_draw_filter(hash))
+			return;
 		big::g_hooking->get_original<hook_DoDraw3DThumbnail>()(vec_ref, index, param, hash);
 	}
 
@@ -129,7 +213,7 @@ namespace lua::hades::draw
 
 		// Data section (5 pointers, filled at runtime)
 		*(uintptr_t*)(data_base + 0x00) = (uintptr_t)&g_any_active;
-		*(uintptr_t*)(data_base + 0x08) = (uintptr_t)&is_hash_hidden;
+		*(uintptr_t*)(data_base + 0x08) = (uintptr_t)&check_draw_entry;
 		*(uintptr_t*)(data_base + 0x10) = shadow_continue;
 		*(uintptr_t*)(data_base + 0x18) = main_continue;
 		*(uintptr_t*)(data_base + 0x20) = loop_next;
@@ -147,25 +231,42 @@ namespace lua::hades::draw
 			return (int32_t)((data_base + data_off) - ((uintptr_t)p + rest));
 		};
 
-		// Fast path: if nothing is hidden, skip straight to original code
+		// Fast path: if nothing is active (no hidden, no remap), skip to original
 		emit({0x48, 0x8B, 0x05}); emit_rel32(rip_data(0x00, 4)); // mov rax, [rip+g_any_active]
 		emit({0x80, 0x38, 0x00});                                  // cmp byte [rax], 0
 		emit({0x74}); size_t je_fast = cur(); emit({0x00});         // je .not_hidden
 
-		// Slow path: save regs, call is_hash_hidden(ecx = [r10+0x28])
+		// Slow path: call check_draw_entry(ecx=hash, rdx=&out_hash)
+		// Returns: eax=0 pass, eax=1 hidden, eax=2 remapped
 		emit({0x51, 0x52});                                         // push rcx; push rdx
-		emit({0x48, 0x83, 0xEC, 0x28});                             // sub rsp, 0x28
+		emit({0x48, 0x83, 0xEC, 0x30});                             // sub rsp, 0x30 (shadow + local)
 		emit({0x41, 0x8B, 0x4A, 0x28});                             // mov ecx, [r10+0x28]
-		emit({0x48, 0x8B, 0x05}); emit_rel32(rip_data(0x08, 4));   // mov rax, [rip+is_hash_hidden]
+		emit({0x48, 0x8D, 0x54, 0x24, 0x28});                      // lea rdx, [rsp+0x28] (out_hash)
+		emit({0x48, 0x8B, 0x05}); emit_rel32(rip_data(0x08, 4));   // mov rax, [rip+check_draw_entry]
 		emit({0xFF, 0xD0});                                         // call rax
-		emit({0x48, 0x83, 0xC4, 0x28});                             // add rsp, 0x28
+		emit({0x83, 0xF8, 0x01});                                   // cmp eax, 1
+		emit({0x74}); size_t je_skip = cur(); emit({0x00});          // je .skip
+		emit({0x83, 0xF8, 0x02});                                   // cmp eax, 2
+		emit({0x74}); size_t je_remap = cur(); emit({0x00});         // je .remap
+		// eax=0: pass through
+		emit({0x48, 0x83, 0xC4, 0x30});                             // add rsp, 0x30
 		emit({0x5A, 0x59});                                         // pop rdx; pop rcx
-		emit({0x84, 0xC0});                                         // test al, al
-		emit({0x75}); size_t jnz_skip = cur(); emit({0x00});        // jnz .skip
+		emit({0xEB}); size_t jmp_not_hidden = cur(); emit({0x00});   // jmp .not_hidden
+
+		// .remap — rewrite [r10+0x28] with remapped hash, then pass through
+		size_t remap_off = cur();
+		*((uint8_t*)cave + je_remap) = (uint8_t)(remap_off - je_remap - 1);
+		emit({0x8B, 0x44, 0x24, 0x28});                             // mov eax, [rsp+0x28] (out_hash)
+		emit({0x41, 0x89, 0x42, 0x28});                             // mov [r10+0x28], eax (overwrite!)
+		emit({0x48, 0x83, 0xC4, 0x30});                             // add rsp, 0x30
+		emit({0x5A, 0x59});                                         // pop rdx; pop rcx
+		emit({0xEB}); size_t jmp_not_hidden2 = cur(); emit({0x00});  // jmp .not_hidden
 
 		// .not_hidden — replay original instructions
 		size_t not_hidden = cur();
 		*((uint8_t*)cave + je_fast) = (uint8_t)(not_hidden - je_fast - 1);
+		*((uint8_t*)cave + jmp_not_hidden) = (uint8_t)(not_hidden - jmp_not_hidden - 1);
+		*((uint8_t*)cave + jmp_not_hidden2) = (uint8_t)(not_hidden - jmp_not_hidden2 - 1);
 		emit({0x41, 0x80, 0x7A, 0x2D, 0x00});                      // cmp byte [r10+0x2d], 0
 		emit({0x74}); size_t je_main = cur(); emit({0x00});          // je .main
 		emit({0xFF, 0x25}); emit_rel32(rip_data(0x10, 4));          // jmp [shadow_continue]
@@ -177,7 +278,9 @@ namespace lua::hades::draw
 
 		// .skip — entry is hidden, advance loop
 		size_t skip_off = cur();
-		*((uint8_t*)cave + jnz_skip) = (uint8_t)(skip_off - jnz_skip - 1);
+		*((uint8_t*)cave + je_skip) = (uint8_t)(skip_off - je_skip - 1);
+		emit({0x48, 0x83, 0xC4, 0x30});                             // add rsp, 0x30
+		emit({0x5A, 0x59});                                         // pop rdx; pop rcx
 		emit({0xFF, 0x25}); emit_rel32(rip_data(0x20, 4));          // jmp [loop_next]
 
 		LOG(INFO) << "draw: shadow cave at " << HEX_TO_UPPER(cave_addr)
@@ -237,12 +340,107 @@ namespace lua::hades::draw
 			new_size = g_hidden_entries.size();
 		}
 
-		g_any_active = g_hidden_entries.empty() ? 0 : 1;
+		update_active_flag();
 
 		LOG(INFO) << "draw: " << entry_name
 		          << (visible ? " SHOW" : " HIDE")
 		          << " (hash=" << guid.mId
 		          << ", set " << old_size << " -> " << new_size << ")";
+	}
+
+	// Lua API: Function
+	// Table: data
+	// Name: set_draw_remap
+	// Param: source_entry: string: Original model entry name (e.g. "HecateBattle_Mesh").
+	// Param: target_entry: string: Variant entry name to draw instead.
+	// Redirects a model entry to draw a different mModelData entry.
+	// Takes effect immediately.  Use `clear_draw_remap` to revert.
+	//
+	// **Example Usage:**
+	// ```lua
+	// rom.data.set_draw_remap("HecateBattle_Mesh", "HecateBattle_Mesh___Enderclem-HecateBiMod")
+	// ```
+	static void set_draw_remap(const std::string& source_entry, const std::string& target_entry)
+	{
+		// Source is a game-known name (Lookup works).
+		// Target may be a custom variant name (needs StringIntern).
+		static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+		    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+
+		sgg::HashGuid src{};
+		Lookup(&src, source_entry.c_str(), source_entry.size());
+		sgg::HashGuid tgt = intern_string(target_entry);
+
+		if (src.mId == 0 || tgt.mId == 0)
+		{
+			LOG(WARNING) << "draw: remap hash=0 for '"
+			             << (src.mId == 0 ? source_entry : target_entry)
+			             << "' — hash system not ready, skipping";
+			return;
+		}
+
+		{
+			std::unique_lock l(g_mutex);
+			g_remap[src.mId] = tgt.mId;
+		}
+		update_active_flag();
+
+		LOG(INFO) << "draw: remap " << source_entry << " -> " << target_entry
+		          << " (hash " << src.mId << " -> " << tgt.mId << ")";
+	}
+
+	// Lua API: Function
+	// Table: data
+	// Name: set_draw_remap_hash
+	// Param: source_hash: number: Source entry hash (from get_hash_guid_from_string).
+	// Param: target_hash: number: Target entry hash.
+	// Like set_draw_remap but takes pre-resolved numeric hashes.
+	// Use when variant entry names aren't in the string intern table.
+	static void set_draw_remap_hash(lua_Number source_hash, lua_Number target_hash)
+	{
+		auto src = (unsigned int)source_hash;
+		auto tgt = (unsigned int)target_hash;
+
+		{
+			std::unique_lock l(g_mutex);
+			g_remap[src] = tgt;
+		}
+		update_active_flag();
+
+		LOG(INFO) << "draw: remap hash " << src << " -> " << tgt;
+	}
+
+	// Lua API: Function
+	// Table: data
+	// Name: clear_draw_remap
+	// Param: source_entry: string: Original model entry name to clear remap for.
+	// Reverts a model entry to draw its original mModelData entry.
+	//
+	// **Example Usage:**
+	// ```lua
+	// rom.data.clear_draw_remap("HecateBattle_Mesh")
+	// ```
+	static void clear_draw_remap(const std::string& source_entry)
+	{
+		static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+		    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+
+		sgg::HashGuid src{};
+		Lookup(&src, source_entry.c_str(), source_entry.size());
+
+		if (src.mId == 0)
+		{
+			LOG(WARNING) << "draw: clear_remap hash=0 for '" << source_entry << "'";
+			return;
+		}
+
+		{
+			std::unique_lock l(g_mutex);
+			g_remap.erase(src.mId);
+		}
+		update_active_flag();
+
+		LOG(INFO) << "draw: clear remap " << source_entry << " (hash " << src.mId << ")";
 	}
 
 	// ─── Registration ─────────────────────────────────────────────────
@@ -251,6 +449,14 @@ namespace lua::hades::draw
 	{
 		auto ns = lua_ext["data"].get_or_create<sol::table>();
 		ns.set_function("set_draw_visible", set_draw_visible);
+		ns.set_function("set_draw_remap", set_draw_remap);
+		ns.set_function("set_draw_remap_hash", set_draw_remap_hash);
+		ns.set_function("clear_draw_remap", clear_draw_remap);
+		ns.set_function("load_model_entry", load_model_entry);
+
+		// NOTE: No hook on LoadAllModelAndAnimationData — a second detour
+		// are loaded automatically by the game when add_granny_file exposes
+		// them.  The double-hook was causing weapon model corruption.
 
 		// Detour hooks on DoDraw3D, DoDrawShadow3D, DoDraw3DThumbnail.
 		{
