@@ -33,8 +33,10 @@
 #include <lua/lua_manager.hpp>
 #include <atomic>
 #include <memory/gm_address.hpp>
+#include <mutex>
 #include <shared_mutex>
 #include <string/string.hpp>
+#include <unordered_map>
 
 namespace lua::hades::draw
 {
@@ -838,6 +840,140 @@ namespace lua::hades::draw
 			}
 			LOG(INFO) << "populate_entry_textures: '" << entry << "' populated " << populated << " handle(s)";
 			return populated;
+		});
+
+		// Lua API: Function
+		// Table: data
+		// Name: set_mesh_visible
+		// Param: entry_name: string: Model entry (e.g. "HecateHub_Mesh").
+		// Param: mesh_name: string: Mesh name inside that entry (e.g. "TorusHubMesh").
+		// Param: visible: boolean: true to show, false to hide.
+		// Returns: boolean — true on success.
+		//
+		// Finer-grained than set_draw_visible (which hides the whole entry):
+		// walks the entry's GrannyMeshData vector, finds the mesh whose
+		// mesh-name hash at GMD+0x48 matches `mesh_name`, and flips its
+		// index count (GMD+0x38) between 0 (hide) and the original value
+		// (show).  DoDraw3D still issues the draw call but with icount=0,
+		// which is a no-op — the pipeline stays primed for other meshes
+		// in the same entry.
+		//
+		// Used for instant accessory toggle: mesh_add mods merge their
+		// meshes INTO stock entries, so the entry-level draw-gate would
+		// hide the body alongside the accessory.  Per-mesh visibility
+		// keeps the body on and only suppresses the accessory meshes.
+		ns.set_function("set_mesh_visible", [](const std::string& entry,
+		                                        const std::string& mesh_name,
+		                                        bool visible) -> bool {
+			// Saved icount per (entry_hash, mesh_hash) so hide→show
+			// restores the original count instead of losing it.
+			static std::unordered_map<uint64_t, uint32_t> g_saved_icount;
+			static std::mutex g_saved_mutex;
+
+			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+			    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+			auto mdata_addr = big::hades2_symbol_to_address["sgg::Granny3D::mModelData"];
+			if (!Lookup || !mdata_addr)
+			{
+				LOG(ERROR) << "set_mesh_visible: required symbols missing";
+				return false;
+			}
+
+			sgg::HashGuid entry_guid{};
+			Lookup(&entry_guid, entry.c_str(), entry.size());
+			if (!entry_guid.mId)
+			{
+				LOG(WARNING) << "set_mesh_visible: entry hash=0 for '" << entry << "'";
+				return false;
+			}
+			sgg::HashGuid mesh_guid{};
+			Lookup(&mesh_guid, mesh_name.c_str(), mesh_name.size());
+			if (!mesh_guid.mId)
+			{
+				LOG(WARNING) << "set_mesh_visible: mesh hash=0 for '" << mesh_name << "'";
+				return false;
+			}
+
+			uint8_t* mdata = mdata_addr.as<uint8_t*>();
+			void* buckets_ptr = nullptr;
+			uint64_t bucket_count = 0;
+			if (!safe_read_ptr(mdata + 0x08, &buckets_ptr)) return false;
+			if (!safe_read_u64(mdata + 0x10, &bucket_count)) return false;
+			if (!buckets_ptr || !bucket_count || bucket_count > 0x100000) return false;
+
+			uint32_t h = entry_guid.mId;
+			h = ((h >> 16) ^ h) * 0x7feb352d;
+			h = ((h >> 15) ^ h) * 0x846ca68b;
+			h = (h >> 16) ^ h;
+			uint8_t* node = (uint8_t*)((void**)buckets_ptr)[h % bucket_count];
+			int walk_guard = 0;
+			while (node && walk_guard++ < 32)
+			{
+				uint32_t id = 0;
+				if (!safe_read_u32(node, &id)) return false;
+				if (id == entry_guid.mId) break;
+				void* nxt = nullptr;
+				if (!safe_read_ptr(node + 0xC0, &nxt)) return false;
+				node = (uint8_t*)nxt;
+			}
+			if (!node || walk_guard >= 32)
+			{
+				LOG(WARNING) << "set_mesh_visible: entry '" << entry << "' not in mModelData";
+				return false;
+			}
+
+			void* vb_p = nullptr; void* ve_p = nullptr;
+			if (!safe_read_ptr(node + 0x10, &vb_p)) return false;
+			if (!safe_read_ptr(node + 0x18, &ve_p)) return false;
+			uint8_t* vec_begin = (uint8_t*)vb_p;
+			uint8_t* vec_end   = (uint8_t*)ve_p;
+			size_t mesh_count = (vec_end >= vec_begin) ? (size_t)(vec_end - vec_begin) / 0x50 : 0;
+			if (mesh_count == 0 || mesh_count > 128) return false;
+
+			uint64_t key = ((uint64_t)entry_guid.mId << 32) | mesh_guid.mId;
+			bool matched = false;
+			for (size_t i = 0; i < mesh_count; i++)
+			{
+				uint8_t* gmd = vec_begin + i * 0x50;
+				uint32_t gmd_mesh_hash = 0;
+				if (!safe_read_u32(gmd + 0x48, &gmd_mesh_hash)) continue;
+				if (gmd_mesh_hash != mesh_guid.mId) continue;
+
+				uint32_t current_icount = 0;
+				if (!safe_read_u32(gmd + 0x38, &current_icount)) continue;
+
+				std::lock_guard lk(g_saved_mutex);
+				if (visible)
+				{
+					auto it = g_saved_icount.find(key);
+					if (it != g_saved_icount.end())
+					{
+						*(uint32_t*)(gmd + 0x38) = it->second;
+						g_saved_icount.erase(it);
+					}
+					// else: already visible — no-op
+				}
+				else
+				{
+					if (current_icount != 0 && !g_saved_icount.count(key))
+					{
+						g_saved_icount[key] = current_icount;
+						*(uint32_t*)(gmd + 0x38) = 0;
+					}
+					// else: already hidden — no-op
+				}
+				matched = true;
+				break;
+			}
+			if (!matched)
+			{
+				LOG(WARNING) << "set_mesh_visible: mesh '" << mesh_name
+				             << "' not in entry '" << entry << "'";
+				return false;
+			}
+			LOG(INFO) << "set_mesh_visible: " << entry << "/" << mesh_name
+			          << " -> " << (visible ? "show" : "hide");
+			return true;
 		});
 
 		// Lua API: Function
