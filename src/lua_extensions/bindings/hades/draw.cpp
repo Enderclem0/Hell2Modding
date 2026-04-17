@@ -32,10 +32,12 @@
 #include <hooks/hooking.hpp>
 #include <lua/lua_manager.hpp>
 #include <atomic>
+#include <map>
 #include <memory/gm_address.hpp>
 #include <mutex>
 #include <shared_mutex>
 #include <string/string.hpp>
+#include <tuple>
 #include <unordered_map>
 
 namespace lua::hades::draw
@@ -872,13 +874,16 @@ namespace lua::hades::draw
 		ns.set_function("set_mesh_visible", [](const std::string& entry,
 		                                        const std::string& mesh_name,
 		                                        bool visible) -> bool {
-			// Saved mesh_type per GMD pointer so hide→show restores the
-			// original type per-mesh.  Keyed by address (stable for the
-			// session) instead of (entry,hash) so multiple GMDs in the
-			// same entry sharing a hash can each record their own prior
-			// state — useful for main+outline+shadow variants a modder
-			// may ship under related names or via duplicate GLB meshes.
-			static std::unordered_map<uintptr_t, uint8_t> g_saved_mesh_type;
+			// Saved mesh_type keyed by (entry_hash, mesh_hash, idx).  Index
+			// distinguishes multiple GMDs sharing the same name hash
+			// (e.g. main+outline+shadow variants under a shared name, or
+			// duplicate GLB meshes split by material).  Using raw GMD
+			// pointer would be invalidated if the GMD vector ever
+			// reallocates — unlikely in Hades II's static-load model but
+			// not guaranteed by the engine contract.  std::map so we
+			// don't have to write a tuple hasher.
+			using SavedKey = std::tuple<uint32_t, uint32_t, size_t>;
+			static std::map<SavedKey, uint8_t> g_saved_mesh_type;
 			static std::mutex g_saved_mutex;
 
 			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
@@ -954,11 +959,11 @@ namespace lua::hades::draw
 				if (gmd_mesh_hash != mesh_guid.mId) continue;
 
 				uint8_t current_type = *(uint8_t*)(gmd + 0x4C);
-				uintptr_t gmd_key = (uintptr_t)gmd;
+				SavedKey key{entry_guid.mId, mesh_guid.mId, i};
 
 				if (visible)
 				{
-					auto it = g_saved_mesh_type.find(gmd_key);
+					auto it = g_saved_mesh_type.find(key);
 					if (it != g_saved_mesh_type.end())
 					{
 						*(uint8_t*)(gmd + 0x4C) = it->second;
@@ -968,9 +973,9 @@ namespace lua::hades::draw
 				}
 				else
 				{
-					if (current_type != HIDE_TYPE && !g_saved_mesh_type.count(gmd_key))
+					if (current_type != HIDE_TYPE && !g_saved_mesh_type.count(key))
 					{
-						g_saved_mesh_type[gmd_key] = current_type;
+						g_saved_mesh_type[key] = current_type;
 						*(uint8_t*)(gmd + 0x4C) = HIDE_TYPE;
 					}
 					// else: already hidden — no-op

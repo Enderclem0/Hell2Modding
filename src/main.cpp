@@ -2385,11 +2385,17 @@ extern "C" __declspec(dllexport) void my_main()
 	//
 	// Must run before ForgeRenderer init fires at game startup.  my_main()
 	// runs at DLL attach — safely before that.
+	//
+	// Each patch records its outcome in `cg3h_patch_status` so the init
+	// summary below shows applied / skipped at a glance — post-game-update
+	// regressions are otherwise invisible (we only LOG(WARNING) per site).
+	std::vector<std::pair<const char*, bool>> cg3h_patch_status;
 	{
 		// Vertex pool: per-shader-effect.  Default 64 MB (0x04000000).
 		// sgg::addShaderEffect calls sgg::addStaticVertexBuffers with size
 		// pushed as the 5th arg via `mov qword [rsp+0x20], imm32`.
 		// Patch 64 MB -> 128 MB.
+		bool v_applied = false;
 		auto v_scan = gmAddress::scan(
 		    "48 C7 44 24 20 00 00 00 04 E8",
 		    "mov [rsp+0x20], 64MB (vertex pool size in sgg::addShaderEffect)");
@@ -2400,18 +2406,26 @@ extern "C" __declspec(dllexport) void my_main()
 			{
 				ForceWrite<uint8_t>(*imm_hi, 0x08);
 				LOG(INFO) << "CG3H: raised static vertex pool from 64 MB to 128 MB";
+				v_applied = true;
+			}
+			else
+			{
+				LOG(WARNING) << "CG3H: vertex pool patch site byte != 0x04 (got "
+				             << HEX_TO_UPPER(*imm_hi) << ")";
 			}
 		}
 		else
 		{
 			LOG(WARNING) << "CG3H: could not find vertex pool patch site";
 		}
+		cg3h_patch_status.emplace_back("vertex pool 64->128 MB", v_applied);
 
 		// Index pool: single global buffer (sgg::gStaticIndexBuffers).
 		// Default 32 MB (0x02000000).  Allocated once inside
 		// sgg::addStaticVertexBuffers via `mov qword [rsp+0x40], imm32`
 		// (gated by null-check against gStaticIndexBuffers).
 		// Patch 32 MB -> 64 MB.
+		bool i_applied = false;
 		auto i_scan = gmAddress::scan(
 		    "48 C7 44 24 40 00 00 00 02 48",
 		    "mov [rsp+0x40], 32MB (index pool size in sgg::addStaticVertexBuffers)");
@@ -2422,11 +2436,39 @@ extern "C" __declspec(dllexport) void my_main()
 			{
 				ForceWrite<uint8_t>(*imm_hi, 0x04);
 				LOG(INFO) << "CG3H: raised static index pool from 32 MB to 64 MB";
+				i_applied = true;
+			}
+			else
+			{
+				LOG(WARNING) << "CG3H: index pool patch site byte != 0x02 (got "
+				             << HEX_TO_UPPER(*imm_hi) << ")";
 			}
 		}
 		else
 		{
 			LOG(WARNING) << "CG3H: could not find index pool patch site";
+		}
+		cg3h_patch_status.emplace_back("index pool 32->64 MB", i_applied);
+	}
+
+	// CG3H patch summary — one line per patch, applied/skipped.
+	// The shadow-cast cave in draw.cpp logs its own status too.
+	{
+		int applied = 0, skipped = 0;
+		for (auto& [name, ok] : cg3h_patch_status)
+		{
+			LOG(INFO) << "CG3H patch: [" << (ok ? "OK  " : "SKIP") << "] " << name;
+			(ok ? applied : skipped)++;
+		}
+		if (skipped)
+		{
+			LOG(WARNING) << "CG3H: " << skipped << " of " << cg3h_patch_status.size()
+			             << " patches skipped — game update may have shifted byte "
+			                "patterns; mods that depend on raised pool caps will regress";
+		}
+		else
+		{
+			LOG(INFO) << "CG3H: all " << applied << " patch(es) applied";
 		}
 	}
 
