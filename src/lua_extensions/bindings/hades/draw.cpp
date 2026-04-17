@@ -853,10 +853,17 @@ namespace lua::hades::draw
 		// Finer-grained than set_draw_visible (which hides the whole entry):
 		// walks the entry's GrannyMeshData vector, finds the mesh whose
 		// mesh-name hash at GMD+0x48 matches `mesh_name`, and flips its
-		// index count (GMD+0x38) between 0 (hide) and the original value
-		// (show).  DoDraw3D still issues the draw call but with icount=0,
-		// which is a no-op — the pipeline stays primed for other meshes
-		// in the same entry.
+		// texture-name hash at GMD+0x40 between 0 (hide) and the original
+		// value (show).
+		//
+		// Hide path uses DoDraw3D's OWN mesh-type switch: setting
+		// GMD+0x4C = 2 makes the main-draw function skip to
+		// next-iteration at 0x1401ebd25 — no cmdDrawIndexed is issued,
+		// no texture lookup attempted.  This is the same branch the
+		// engine takes for its own shadow meshes (they're drawn via
+		// DoDrawShadow3D instead, which our accessory meshes don't
+		// have a shadow entry in, so they stay hidden everywhere).
+		// No DX12 validation errors, no command-list poisoning.
 		//
 		// Used for instant accessory toggle: mesh_add mods merge their
 		// meshes INTO stock entries, so the entry-level draw-gate would
@@ -865,9 +872,9 @@ namespace lua::hades::draw
 		ns.set_function("set_mesh_visible", [](const std::string& entry,
 		                                        const std::string& mesh_name,
 		                                        bool visible) -> bool {
-			// Saved icount per (entry_hash, mesh_hash) so hide→show
-			// restores the original count instead of losing it.
-			static std::unordered_map<uint64_t, uint32_t> g_saved_icount;
+			// Saved mesh_type per (entry_hash, mesh_hash) so hide→show
+			// restores the original type instead of losing it.
+			static std::unordered_map<uint64_t, uint8_t> g_saved_mesh_type;
 			static std::mutex g_saved_mutex;
 
 			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
@@ -931,6 +938,9 @@ namespace lua::hades::draw
 			if (mesh_count == 0 || mesh_count > 128) return false;
 
 			uint64_t key = ((uint64_t)entry_guid.mId << 32) | mesh_guid.mId;
+			// Sentinel byte used for hidden state (= shadow mesh type,
+			// which DoDraw3D skips to next-iteration).
+			constexpr uint8_t HIDE_TYPE = 2;
 			bool matched = false;
 			for (size_t i = 0; i < mesh_count; i++)
 			{
@@ -939,26 +949,25 @@ namespace lua::hades::draw
 				if (!safe_read_u32(gmd + 0x48, &gmd_mesh_hash)) continue;
 				if (gmd_mesh_hash != mesh_guid.mId) continue;
 
-				uint32_t current_icount = 0;
-				if (!safe_read_u32(gmd + 0x38, &current_icount)) continue;
+				uint8_t current_type = *(uint8_t*)(gmd + 0x4C);
 
 				std::lock_guard lk(g_saved_mutex);
 				if (visible)
 				{
-					auto it = g_saved_icount.find(key);
-					if (it != g_saved_icount.end())
+					auto it = g_saved_mesh_type.find(key);
+					if (it != g_saved_mesh_type.end())
 					{
-						*(uint32_t*)(gmd + 0x38) = it->second;
-						g_saved_icount.erase(it);
+						*(uint8_t*)(gmd + 0x4C) = it->second;
+						g_saved_mesh_type.erase(it);
 					}
 					// else: already visible — no-op
 				}
 				else
 				{
-					if (current_icount != 0 && !g_saved_icount.count(key))
+					if (current_type != HIDE_TYPE && !g_saved_mesh_type.count(key))
 					{
-						g_saved_icount[key] = current_icount;
-						*(uint32_t*)(gmd + 0x38) = 0;
+						g_saved_mesh_type[key] = current_type;
+						*(uint8_t*)(gmd + 0x4C) = HIDE_TYPE;
 					}
 					// else: already hidden — no-op
 				}
