@@ -685,6 +685,119 @@ namespace lua::hades::draw
 
 		// Lua API: Function
 		// Table: data
+		// Name: sanity_check_gmd
+		// Param: entry_name: string: A known stock entry (e.g. "HecateHub_Mesh").
+		// Returns: integer — number of failed checks (0 = layout matches expected).
+		//
+		// Lightweight canary that validates CG3H's hardcoded GMD assumptions
+		// against a live entry loaded into mModelData.  Checks: entry found,
+		// GMD vector size is a multiple of 0x50, each GMD has a sane
+		// mesh_type (0/1/2), non-zero tex_name_hash (+0x40) and
+		// mesh_name_hash (+0x48).  Fails → logs LOG(ERROR) per check so a
+		// game update that shifts offsets surfaces in a dedicated line
+		// instead of downstream "why is the body invisible" mysteries.
+		//
+		// Meant to be called once at first-ImGui-frame time with a known
+		// entry.  Cheap — scans ≤ 20 meshes in the entry.
+		ns.set_function("sanity_check_gmd", [](const std::string& entry) -> int {
+			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+			    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+			auto mdata_addr = big::hades2_symbol_to_address["sgg::Granny3D::mModelData"];
+			if (!Lookup || !mdata_addr)
+			{
+				LOG(ERROR) << "sanity_check_gmd: required symbols missing";
+				return 1;
+			}
+
+			sgg::HashGuid g{};
+			Lookup(&g, entry.c_str(), entry.size());
+			if (!g.mId)
+			{
+				LOG(ERROR) << "sanity_check_gmd: entry hash=0 for '" << entry << "'";
+				return 1;
+			}
+
+			uint8_t* mdata = mdata_addr.as<uint8_t*>();
+			void* buckets_ptr = nullptr;
+			uint64_t bucket_count = 0;
+			if (!safe_read_ptr(mdata + 0x08, &buckets_ptr)
+			    || !safe_read_u64(mdata + 0x10, &bucket_count)
+			    || !buckets_ptr || !bucket_count || bucket_count > 0x100000)
+			{
+				LOG(ERROR) << "sanity_check_gmd: mModelData hashtable shape unexpected";
+				return 1;
+			}
+
+			uint32_t h = g.mId;
+			h = ((h >> 16) ^ h) * 0x7feb352d;
+			h = ((h >> 15) ^ h) * 0x846ca68b;
+			h = (h >> 16) ^ h;
+			uint8_t* node = (uint8_t*)((void**)buckets_ptr)[h % bucket_count];
+			int walk = 0;
+			while (node && walk++ < 32)
+			{
+				uint32_t id = 0;
+				if (!safe_read_u32(node, &id)) { node = nullptr; break; }
+				if (id == g.mId) break;
+				void* nxt = nullptr;
+				if (!safe_read_ptr(node + 0xC0, &nxt)) { node = nullptr; break; }
+				node = (uint8_t*)nxt;
+			}
+			if (!node)
+			{
+				LOG(ERROR) << "sanity_check_gmd: entry '" << entry << "' missing from mModelData";
+				return 1;
+			}
+
+			void* vb_p = nullptr; void* ve_p = nullptr;
+			if (!safe_read_ptr(node + 0x10, &vb_p) || !safe_read_ptr(node + 0x18, &ve_p))
+			{
+				LOG(ERROR) << "sanity_check_gmd: GMD vector pointers unreadable";
+				return 1;
+			}
+			uint8_t* vb = (uint8_t*)vb_p;
+			uint8_t* ve = (uint8_t*)ve_p;
+			ptrdiff_t span = ve - vb;
+			int fails = 0;
+			if (span <= 0 || (span % 0x50) != 0)
+			{
+				LOG(ERROR) << "sanity_check_gmd: GMD span " << span
+				           << " not a multiple of expected stride 0x50";
+				fails++;
+			}
+			size_t n = (span > 0) ? (size_t)(span / 0x50) : 0;
+			if (n == 0 || n > 128)
+			{
+				LOG(ERROR) << "sanity_check_gmd: unreasonable mesh count " << n;
+				return fails + 1;
+			}
+			for (size_t i = 0; i < n && i < 20; i++)
+			{
+				uint8_t* gmd = vb + i * 0x50;
+				uint8_t mtype = *(uint8_t*)(gmd + 0x4C);
+				uint32_t th = 0, mh = 0;
+				safe_read_u32(gmd + 0x40, &th);
+				safe_read_u32(gmd + 0x48, &mh);
+				if (mtype > 2)
+				{
+					LOG(ERROR) << "sanity_check_gmd: mesh[" << i << "] type="
+					           << (int)mtype << " (expected 0/1/2)";
+					fails++;
+				}
+				if (mh == 0)
+				{
+					LOG(ERROR) << "sanity_check_gmd: mesh[" << i << "] name hash=0";
+					fails++;
+				}
+			}
+			if (fails == 0)
+				LOG(INFO) << "sanity_check_gmd: '" << entry << "' layout OK ("
+				          << n << " meshes)";
+			return fails;
+		});
+
+		// Lua API: Function
+		// Table: data
 		// Name: dump_pool_stats
 		// Returns: integer — number of per-shader vertex buffers dumped.
 		// Walks sgg::gStaticDrawBuffers and logs each shader-effect's
