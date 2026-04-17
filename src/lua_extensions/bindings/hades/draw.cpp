@@ -702,8 +702,13 @@ namespace lua::hades::draw
 			auto vec_begin = *(uint8_t **)(vec + 0x00);
 			auto vec_end   = *(uint8_t **)(vec + 0x08);
 			size_t count = (vec_end - vec_begin) / 72;
-			auto effects = shader_effects.as<uint8_t *>();
-			LOG(INFO) << "=== Static vertex pool stats (" << count << " shader effects) ===";
+			LOG(INFO) << "=== Static vertex pool stats (" << count << " geo buffers) ===";
+			// The shader→geo mapping isn't 1:1 (addShaderEffect calls
+			// addStaticVertexBuffers twice with different sizes per effect),
+			// so deriving the real per-shader byte stride from the geo
+			// index alone is wrong.  Instead, report raw cursor + capacity,
+			// plus a rough estimate at the common 40 B character-vertex
+			// stride.  Only the raw cursor / capacity should be trusted.
 			int logged = 0;
 			for (size_t i = 0; i < count && i < 128; ++i)
 			{
@@ -713,16 +718,15 @@ namespace lua::hades::draw
 				uint32_t cursor = *(uint32_t *)(geo + 0x40);
 				uint64_t msize_raw = *(uint64_t *)(buf + 0x38);
 				uint32_t msize = (uint32_t)msize_raw;
-				uint32_t stride = *(uint32_t *)(effects + i * 0xf28 + 0x95c);
-				uint64_t used_bytes = (uint64_t)cursor * stride;
-				double pct = msize ? (100.0 * used_bytes / msize) : 0.0;
-				LOG(INFO) << "  effect[" << i << "]: "
-				          << (used_bytes / (1024.0 * 1024.0)) << " MB / "
-				          << (msize / (1024.0 * 1024.0)) << " MB ("
-				          << pct << "%) cursor=" << cursor << " stride=" << stride;
+				double cap_mb = msize / (1024.0 * 1024.0);
+				double est_mb = (uint64_t)cursor * 40 / (1024.0 * 1024.0);
+				LOG(INFO) << "  geo[" << i << "]: capacity=" << cap_mb
+				          << " MB  cursor=" << cursor << " verts (~"
+				          << est_mb << " MB @ 40B/vert)";
 				logged++;
 			}
-			// gStaticIndexBuffers is a data symbol holding Buffer*, so deref.
+			// Index buffer uses fixed 2-byte stride — bounds check is
+			// exact, so this % is reliable (unlike the vertex-pool one).
 			uint8_t *ibuf = *idx_buf_ptr.as<uint8_t **>();
 			uint32_t ioff = *idx_off_ptr.as<uint32_t *>();
 			if (ibuf)
