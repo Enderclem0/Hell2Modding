@@ -132,17 +132,9 @@ namespace lua::hades::draw
 	}
 
 	// ─── Detour hooks (DoDraw3D, DoDrawShadow3D, DoDraw3DThumbnail) ──
-
-	// Helper: apply remap + hidden check on a hash.  Returns true if the
-	// entry should be drawn (possibly with a modified hash).
-	static bool apply_draw_filter(sgg::HashGuid& hash)
-	{
-		std::shared_lock l(g_mutex);
-		auto it = g_remap.find(hash.mId);
-		if (it != g_remap.end())
-			hash.mId = it->second;
-		return g_hidden_entries.count(hash.mId) == 0;
-	}
+	// Each hook inlines its own remap + hidden-set check — shadow and
+	// thumbnail paths intentionally check hidden_entries but skip the
+	// hash remap (see v3.9 writeup in project_v39_variant_findings.md).
 
 	static void hook_DoDraw3D(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
