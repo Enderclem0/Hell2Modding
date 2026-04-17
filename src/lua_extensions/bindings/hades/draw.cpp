@@ -872,9 +872,13 @@ namespace lua::hades::draw
 		ns.set_function("set_mesh_visible", [](const std::string& entry,
 		                                        const std::string& mesh_name,
 		                                        bool visible) -> bool {
-			// Saved mesh_type per (entry_hash, mesh_hash) so hide→show
-			// restores the original type instead of losing it.
-			static std::unordered_map<uint64_t, uint8_t> g_saved_mesh_type;
+			// Saved mesh_type per GMD pointer so hide→show restores the
+			// original type per-mesh.  Keyed by address (stable for the
+			// session) instead of (entry,hash) so multiple GMDs in the
+			// same entry sharing a hash can each record their own prior
+			// state — useful for main+outline+shadow variants a modder
+			// may ship under related names or via duplicate GLB meshes.
+			static std::unordered_map<uintptr_t, uint8_t> g_saved_mesh_type;
 			static std::mutex g_saved_mutex;
 
 			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
@@ -937,11 +941,11 @@ namespace lua::hades::draw
 			size_t mesh_count = (vec_end >= vec_begin) ? (size_t)(vec_end - vec_begin) / 0x50 : 0;
 			if (mesh_count == 0 || mesh_count > 128) return false;
 
-			uint64_t key = ((uint64_t)entry_guid.mId << 32) | mesh_guid.mId;
 			// Sentinel byte used for hidden state (= shadow mesh type,
 			// which DoDraw3D skips to next-iteration).
 			constexpr uint8_t HIDE_TYPE = 2;
-			bool matched = false;
+			int matched = 0;
+			std::lock_guard lk(g_saved_mutex);
 			for (size_t i = 0; i < mesh_count; i++)
 			{
 				uint8_t* gmd = vec_begin + i * 0x50;
@@ -950,11 +954,11 @@ namespace lua::hades::draw
 				if (gmd_mesh_hash != mesh_guid.mId) continue;
 
 				uint8_t current_type = *(uint8_t*)(gmd + 0x4C);
+				uintptr_t gmd_key = (uintptr_t)gmd;
 
-				std::lock_guard lk(g_saved_mutex);
 				if (visible)
 				{
-					auto it = g_saved_mesh_type.find(key);
+					auto it = g_saved_mesh_type.find(gmd_key);
 					if (it != g_saved_mesh_type.end())
 					{
 						*(uint8_t*)(gmd + 0x4C) = it->second;
@@ -964,24 +968,26 @@ namespace lua::hades::draw
 				}
 				else
 				{
-					if (current_type != HIDE_TYPE && !g_saved_mesh_type.count(key))
+					if (current_type != HIDE_TYPE && !g_saved_mesh_type.count(gmd_key))
 					{
-						g_saved_mesh_type[key] = current_type;
+						g_saved_mesh_type[gmd_key] = current_type;
 						*(uint8_t*)(gmd + 0x4C) = HIDE_TYPE;
 					}
 					// else: already hidden — no-op
 				}
-				matched = true;
-				break;
+				matched++;
+				// Don't break: continue so main+outline+shadow variants
+				// with the same mesh-name hash all get toggled together.
 			}
-			if (!matched)
+			if (matched == 0)
 			{
 				LOG(WARNING) << "set_mesh_visible: mesh '" << mesh_name
 				             << "' not in entry '" << entry << "'";
 				return false;
 			}
 			LOG(INFO) << "set_mesh_visible: " << entry << "/" << mesh_name
-			          << " -> " << (visible ? "show" : "hide");
+			          << " -> " << (visible ? "show" : "hide")
+			          << " (" << matched << " mesh" << (matched > 1 ? "es" : "") << ")";
 			return true;
 		});
 
