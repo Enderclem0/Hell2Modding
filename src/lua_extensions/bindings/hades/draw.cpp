@@ -31,6 +31,7 @@
 #include <hades2/pdb_symbol_map.hpp>
 #include <hooks/hooking.hpp>
 #include <lua/lua_manager.hpp>
+#include <atomic>
 #include <memory/gm_address.hpp>
 #include <shared_mutex>
 #include <string/string.hpp>
@@ -141,22 +142,44 @@ namespace lua::hades::draw
 
 	static void hook_DoDraw3D(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
-		if (!apply_draw_filter(hash))
-			return;
+		{
+			std::shared_lock l(g_mutex);
+			auto it = g_remap.find(hash.mId);
+			if (it != g_remap.end())
+				hash.mId = it->second;
+			if (g_hidden_entries.count(hash.mId))
+				return;
+		}
 		big::g_hooking->get_original<hook_DoDraw3D>()(vec_ref, index, param, hash);
 	}
 
+	// Shadow + thumbnail paths honor the HIDDEN set (v3.8 visibility gate) but
+	// do NOT participate in hash remap.  Reasoning: DoDrawShadowCast3D is
+	// remapped via a manual code cave that requires hardcoded byte offsets;
+	// when those don't match (post-game-update) the cave fails open and
+	// shadow cast renders with the STOCK hash.  Remapping the other shadow
+	// paths in that state leaves the engine with inconsistent per-entry
+	// state (main=variant, shadow_cast=stock, shadow3D=variant) which
+	// appears to wedge the render thread.  Until the cave is re-fitted on
+	// every patch, shadow/thumbnail follow stock.  The main DoDraw3D (body)
+	// is still remapped — that's where the visual swap happens.
 	static void hook_DoDrawShadow3D(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
-		if (!apply_draw_filter(hash))
-			return;
+		{
+			std::shared_lock l(g_mutex);
+			if (g_hidden_entries.count(hash.mId))
+				return;
+		}
 		big::g_hooking->get_original<hook_DoDrawShadow3D>()(vec_ref, index, param, hash);
 	}
 
 	static void hook_DoDraw3DThumbnail(void* vec_ref, unsigned int index, int param, sgg::HashGuid hash)
 	{
-		if (!apply_draw_filter(hash))
-			return;
+		{
+			std::shared_lock l(g_mutex);
+			if (g_hidden_entries.count(hash.mId))
+				return;
+		}
 		big::g_hooking->get_original<hook_DoDraw3DThumbnail>()(vec_ref, index, param, hash);
 	}
 
@@ -443,6 +466,207 @@ namespace lua::hades::draw
 		LOG(INFO) << "draw: clear remap " << source_entry << " (hash " << src.mId << ")";
 	}
 
+	// ─── v3.9 Option 4: GPU buffer memcpy ──────────────────────────────
+	//
+	// Data-flow:
+	//   shader_byte = GrannyMeshData[+0x48]
+	//   shader_eff  = gShaderEffects + shader_byte * 0xf28
+	//   geo_idx     = *(uint32_t*)(shader_eff + 0x960)
+	//   stride      = *(uint32_t*)(shader_eff + 0x95c)  (typically 40 for char vertex)
+	//   geo_slot    = gStaticDrawBuffers.mpBegin + geo_idx * 72  (ForgeGeometryBuffers)
+	//   vbuffer     = *(Buffer**)(geo_slot + 0x20)
+	//   vbuffer_cpu = *(void**)(vbuffer + 0x00)           (persistent-mapped)
+	//   ibuffer     = *(Buffer**)gStaticIndexBuffers
+	//   ibuffer_cpu = *(void**)(ibuffer + 0x00)
+	//
+	//   Write at: vbuffer_cpu + vertex_handle * stride
+	//             ibuffer_cpu + index_handle  * 2
+	//
+	// Static globals (resolved via PDB, survive game updates):
+	//   sgg::gStaticDrawBuffers              — vector<ForgeGeometryBuffers>
+	//   sgg::gShaderEffects                  — array, stride 0xf28
+	//   sgg::gStaticIndexBuffers             — Buffer* (single global)
+
+	// Plain-C helpers so we can use SEH (__try / __except) to survive bad pointers.
+	// Each helper writes to *out_val and returns non-zero on success, 0 on fault.
+	static int __stdcall safe_read_u64(const void* addr, uint64_t* out_val)
+	{
+		__try { *out_val = *(const uint64_t*)addr; return 1; }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+	}
+
+	static int __stdcall safe_read_u32(const void* addr, uint32_t* out_val)
+	{
+		__try { *out_val = *(const uint32_t*)addr; return 1; }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+	}
+
+	static int __stdcall safe_read_ptr(const void* addr, void** out_val)
+	{
+		__try { *out_val = *(void* const*)addr; return 1; }
+		__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+	}
+
+	// Lua API: Function
+	// Table: data
+	// Name: dump_mesh_info
+	// Param: entry_name: string: Entry name (e.g. "HecateBattle_Mesh").
+	// Logs per-mesh buffer handles, shader, stride, and Buffer CPU pointers.
+	// Used to validate the GPU-memcpy RE plan on a live character.
+	// SEH-protected — reads that hit unmapped memory are logged as faults.
+	static void dump_mesh_info(const std::string& entry_name)
+	{
+		LOG(INFO) << "dump_mesh_info: ENTER '" << entry_name << "'";
+
+		static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+		    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+
+		sgg::HashGuid guid{};
+		Lookup(&guid, entry_name.c_str(), entry_name.size());
+		LOG(INFO) << "  step1: hash=" << guid.mId;
+		if (guid.mId == 0) { LOG(WARNING) << "  abort: hash=0 (hash table not ready or unknown name)"; return; }
+
+		auto mdata_addr = big::hades2_symbol_to_address["sgg::Granny3D::mModelData"];
+		auto sdb_addr   = big::hades2_symbol_to_address["sgg::gStaticDrawBuffers"];
+		auto sef_addr   = big::hades2_symbol_to_address["sgg::gShaderEffects"];
+		auto sib_addr   = big::hades2_symbol_to_address["sgg::gStaticIndexBuffers"];
+		LOG(INFO) << "  step2: symbols"
+		          << " mdata=" << HEX_TO_UPPER(mdata_addr.as<uintptr_t>())
+		          << " sdb="   << HEX_TO_UPPER(sdb_addr.as<uintptr_t>())
+		          << " sef="   << HEX_TO_UPPER(sef_addr.as<uintptr_t>())
+		          << " sib="   << HEX_TO_UPPER(sib_addr.as<uintptr_t>());
+		if (!mdata_addr || !sdb_addr || !sef_addr || !sib_addr)
+		{ LOG(ERROR) << "  abort: one or more symbols missing"; return; }
+
+		// Read hashtable header.
+		uint8_t* mdata = mdata_addr.as<uint8_t*>();
+		void* buckets_ptr = nullptr;
+		uint64_t bucket_count = 0;
+		if (!safe_read_ptr(mdata + 0x08, &buckets_ptr)) { LOG(ERROR) << "  fault reading mdata+0x08"; return; }
+		if (!safe_read_u64(mdata + 0x10, &bucket_count)) { LOG(ERROR) << "  fault reading mdata+0x10"; return; }
+		void** buckets = (void**)buckets_ptr;
+		LOG(INFO) << "  step3: buckets=" << HEX_TO_UPPER((uintptr_t)buckets) << " count=" << bucket_count;
+		if (!buckets || bucket_count == 0 || bucket_count > 0x100000)
+		{ LOG(WARNING) << "  abort: mModelData empty or bogus"; return; }
+
+		// EASTL hashtable bucket lookup (same formula as GetModelFile/LoadModelData).
+		uint32_t h = guid.mId;
+		h = ((h >> 16) ^ h) * 0x7feb352d;
+		h = ((h >> 15) ^ h) * 0x846ca68b;
+		h = (h >> 16) ^ h;
+		uint64_t bucket_idx = h % bucket_count;
+		void* head_ptr = nullptr;
+		if (!safe_read_ptr(&buckets[bucket_idx], &head_ptr)) { LOG(ERROR) << "  fault reading bucket head"; return; }
+		LOG(INFO) << "  step4: bucket_idx=" << bucket_idx << " head=" << HEX_TO_UPPER((uintptr_t)head_ptr);
+
+		uint8_t* node = (uint8_t*)head_ptr;
+		int walk_guard = 0;
+		while (node && walk_guard++ < 32)
+		{
+			uint32_t node_id = 0;
+			if (!safe_read_u32(node, &node_id)) { LOG(ERROR) << "  fault reading node->mId at " << HEX_TO_UPPER((uintptr_t)node); return; }
+			if (node_id == guid.mId) break;
+			void* next = nullptr;
+			if (!safe_read_ptr(node + 0xC0, &next)) { LOG(ERROR) << "  fault reading node->mpNext"; return; }
+			node = (uint8_t*)next;
+		}
+		if (!node || walk_guard >= 32) { LOG(WARNING) << "  abort: entry not found (walked " << walk_guard << ")"; return; }
+		LOG(INFO) << "  step5: node=" << HEX_TO_UPPER((uintptr_t)node);
+
+		// GrannyMeshData vector at node + 0x10 (mpBegin) / +0x18 (mpEnd).
+		void* vec_begin_p = nullptr; void* vec_end_p = nullptr;
+		if (!safe_read_ptr(node + 0x10, &vec_begin_p) || !safe_read_ptr(node + 0x18, &vec_end_p))
+		{ LOG(ERROR) << "  fault reading GMD vector"; return; }
+		uint8_t* vec_begin = (uint8_t*)vec_begin_p;
+		uint8_t* vec_end   = (uint8_t*)vec_end_p;
+		size_t mesh_count = (vec_end >= vec_begin) ? (size_t)(vec_end - vec_begin) / 0x50 : 0;
+		LOG(INFO) << "  step6: vec=" << HEX_TO_UPPER((uintptr_t)vec_begin) << ".." << HEX_TO_UPPER((uintptr_t)vec_end)
+		          << " meshes=" << mesh_count;
+		if (mesh_count == 0 || mesh_count > 128) { LOG(WARNING) << "  abort: mesh_count out of range"; return; }
+
+		uint8_t* sdb_vector = sdb_addr.as<uint8_t*>();
+		uint8_t* sef_base   = sef_addr.as<uint8_t*>();
+		uint8_t* sib_slot   = sib_addr.as<uint8_t*>();
+
+		void* geo_first_p = nullptr;
+		void* ibuffer_p   = nullptr;
+		safe_read_ptr(sdb_vector, &geo_first_p);
+		safe_read_ptr(sib_slot,   &ibuffer_p);
+		uint8_t* geo_first = (uint8_t*)geo_first_p;
+		uint8_t* ibuffer   = (uint8_t*)ibuffer_p;
+		void*    ibuf_cpu  = nullptr;
+		if (ibuffer) safe_read_ptr(ibuffer + 0x00, &ibuf_cpu);
+		LOG(INFO) << "  step7: geo_first=" << HEX_TO_UPPER((uintptr_t)geo_first)
+		          << " ibuffer=" << HEX_TO_UPPER((uintptr_t)ibuffer)
+		          << " ibuf_cpu=" << HEX_TO_UPPER((uintptr_t)ibuf_cpu);
+
+		for (size_t i = 0; i < mesh_count && i < 32; i++)
+		{
+			uint8_t* gmd = vec_begin + i * 0x50;
+			uint32_t vh = 0, ih = 0, icount = 0, vcount = 0, mesh_type = 0;
+			safe_read_u32(gmd + 0x30, &vh);
+			safe_read_u32(gmd + 0x34, &ih);
+			safe_read_u32(gmd + 0x38, &icount);
+			safe_read_u32(gmd + 0x3C, &vcount);
+			safe_read_u32(gmd + 0x4C, &mesh_type);
+
+			// AddModelData's shader selection: type==2 → 0x22, else 0x13.
+			uint8_t  shader_byte = (mesh_type == 2) ? 0x22 : 0x13;
+			uint8_t* sef = sef_base + (uint64_t)shader_byte * 0xf28;
+			uint32_t geo_idx = 0, stride = 0;
+			safe_read_u32(sef + 0x960, &geo_idx);
+			safe_read_u32(sef + 0x95c, &stride);
+
+			uint8_t* geo_slot = geo_first ? (geo_first + (uint64_t)geo_idx * 72) : nullptr;
+			void* vbuf_p = nullptr;
+			if (geo_slot) safe_read_ptr(geo_slot + 0x20, &vbuf_p);
+			uint8_t* vbuf = (uint8_t*)vbuf_p;
+			void* vbuf_cpu = nullptr;
+			if (vbuf) safe_read_ptr(vbuf + 0x00, &vbuf_cpu);
+
+			// Read texture-binding fields at GMD+0x40 (name-hash gate) and +0x44 (handle).
+			uint32_t tex_name_hash = 0, tex_handle = 0;
+			safe_read_u32(gmd + 0x40, &tex_name_hash);
+			safe_read_u32(gmd + 0x44, &tex_handle);
+
+			LOG(INFO) << "  mesh[" << i << "] vh=" << vh << " ih=" << ih
+			          << " vc=" << vcount << " ic=" << icount << " type=" << mesh_type
+			          << " tex_name_hash=" << tex_name_hash
+			          << " tex_handle=0x" << std::hex << tex_handle << std::dec
+			          << " shader=0x" << std::hex << (int)shader_byte << std::dec
+			          << " geo_idx=" << geo_idx << " stride=" << stride
+			          << " vbuf=" << HEX_TO_UPPER((uintptr_t)vbuf)
+			          << " vbuf_cpu=" << HEX_TO_UPPER((uintptr_t)vbuf_cpu);
+
+			// One-shot diagnostic on mesh[0]: dump Buffer struct (first 0x50 bytes)
+			// and a slice of its content at different candidate offsets.
+			if (i == 0 && vbuf)
+			{
+				LOG(INFO) << "    --- Buffer* struct @" << HEX_TO_UPPER((uintptr_t)vbuf);
+				for (int row = 0; row < 5; row++) {
+					uint64_t q[4] = {};
+					for (int k = 0; k < 4; k++) safe_read_u64(vbuf + row*32 + k*8, &q[k]);
+					LOG(INFO) << "      +0x" << std::hex << (row*32) << std::dec
+					          << ": " << HEX_TO_UPPER(q[0]) << " " << HEX_TO_UPPER(q[1])
+					          << " " << HEX_TO_UPPER(q[2]) << " " << HEX_TO_UPPER(q[3]);
+				}
+				// Also scan the first 0x60 bytes of vbuf_cpu to see if there's structured data.
+				if (vbuf_cpu) {
+					LOG(INFO) << "    --- vbuf_cpu base @" << HEX_TO_UPPER((uintptr_t)vbuf_cpu);
+					for (int row = 0; row < 4; row++) {
+						uint32_t d[4] = {};
+						for (int k = 0; k < 4; k++)
+							safe_read_u32((uint8_t*)vbuf_cpu + row*16 + k*4, &d[k]);
+						LOG(INFO) << "      +0x" << std::hex << (row*16) << std::dec
+						          << ": " << HEX_TO_UPPER(d[0]) << " " << HEX_TO_UPPER(d[1])
+						          << " " << HEX_TO_UPPER(d[2]) << " " << HEX_TO_UPPER(d[3]);
+					}
+				}
+			}
+		}
+		LOG(INFO) << "dump_mesh_info: DONE";
+	}
+
 	// ─── Registration ─────────────────────────────────────────────────
 
 	void bind(sol::state_view& state, sol::table& lua_ext)
@@ -453,6 +677,254 @@ namespace lua::hades::draw
 		ns.set_function("set_draw_remap_hash", set_draw_remap_hash);
 		ns.set_function("clear_draw_remap", clear_draw_remap);
 		ns.set_function("load_model_entry", load_model_entry);
+		ns.set_function("dump_mesh_info", dump_mesh_info);
+
+		// Lua API: Function
+		// Table: data
+		// Name: dump_pool_stats
+		// Returns: integer — number of per-shader vertex buffers dumped.
+		// Walks sgg::gStaticDrawBuffers and logs each shader-effect's
+		// vertex pool: total capacity (Buffer.mSize &0xFFFFFFFF at +0x38),
+		// cursor (+0x40 of ForgeGeometryBuffers — next-free vertex slot),
+		// stride (from gShaderEffects[i].+0x95c).  Also logs the single
+		// global gStaticIndexBuffers cursor + size.
+		ns.set_function("dump_pool_stats", []() -> int {
+			auto draw_buf_vec = big::hades2_symbol_to_address["sgg::gStaticDrawBuffers"];
+			auto idx_buf_ptr  = big::hades2_symbol_to_address["sgg::gStaticIndexBuffers"];
+			auto idx_off_ptr  = big::hades2_symbol_to_address["sgg::gStaticIndexBufferOffset"];
+			auto shader_effects = big::hades2_symbol_to_address["sgg::gShaderEffects"];
+			if (!draw_buf_vec || !idx_buf_ptr || !idx_off_ptr || !shader_effects)
+			{
+				LOG(ERROR) << "dump_pool_stats: symbols missing";
+				return 0;
+			}
+			auto vec = draw_buf_vec.as<uint8_t *>();
+			auto vec_begin = *(uint8_t **)(vec + 0x00);
+			auto vec_end   = *(uint8_t **)(vec + 0x08);
+			size_t count = (vec_end - vec_begin) / 72;
+			auto effects = shader_effects.as<uint8_t *>();
+			LOG(INFO) << "=== Static vertex pool stats (" << count << " shader effects) ===";
+			int logged = 0;
+			for (size_t i = 0; i < count && i < 128; ++i)
+			{
+				uint8_t *geo = vec_begin + i * 72;
+				uint8_t *buf = *(uint8_t **)(geo + 0x20);
+				if (!buf) continue;
+				uint32_t cursor = *(uint32_t *)(geo + 0x40);
+				uint64_t msize_raw = *(uint64_t *)(buf + 0x38);
+				uint32_t msize = (uint32_t)msize_raw;
+				uint32_t stride = *(uint32_t *)(effects + i * 0xf28 + 0x95c);
+				uint64_t used_bytes = (uint64_t)cursor * stride;
+				double pct = msize ? (100.0 * used_bytes / msize) : 0.0;
+				LOG(INFO) << "  effect[" << i << "]: "
+				          << (used_bytes / (1024.0 * 1024.0)) << " MB / "
+				          << (msize / (1024.0 * 1024.0)) << " MB ("
+				          << pct << "%) cursor=" << cursor << " stride=" << stride;
+				logged++;
+			}
+			// gStaticIndexBuffers is a data symbol holding Buffer*, so deref.
+			uint8_t *ibuf = *idx_buf_ptr.as<uint8_t **>();
+			uint32_t ioff = *idx_off_ptr.as<uint32_t *>();
+			if (ibuf)
+			{
+				uint64_t imsize_raw = *(uint64_t *)(ibuf + 0x38);
+				uint32_t imsize = (uint32_t)imsize_raw;
+				uint64_t iused = (uint64_t)ioff * 2;
+				double ipct = imsize ? (100.0 * iused / imsize) : 0.0;
+				LOG(INFO) << "  index buf: " << (iused / (1024.0 * 1024.0)) << " MB / "
+				          << (imsize / (1024.0 * 1024.0)) << " MB (" << ipct << "%)";
+			}
+			return logged;
+		});
+
+		// Lua API: Function
+		// Table: data
+		// Name: populate_entry_textures
+		// Param: entry_name: string
+		// Returns: integer — number of textures populated.
+		//
+		// Walks the entry's GrannyMeshData vector and, for each type=0 mesh whose
+		// GMD+0x40 (texture name hash) is non-zero, calls the game's own
+		// sgg::GameAssetManager::GetTexture(hash, &out_handle) and writes the
+		// result into GMD+0x44.  This mimics what ModelAnimation::PrepDraw does
+		// for stock meshes — variants live alongside stock in mModelData but are
+		// never walked by PrepDraw, so their GMD+0x44 stays 0 (→ white rendering
+		// under hash remap).  Calling this once after loading a variant populates
+		// its texture handles so DoDraw3D's fallback path can resolve them.
+		ns.set_function("populate_entry_textures", [](const std::string& entry) -> int {
+			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+			    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+			static auto GetTexture = big::hades2_symbol_to_address["sgg::GameAssetManager::GetTexture"]
+			    .as_func<void(void*, uint32_t*, uint32_t)>();
+			auto mdata_addr = big::hades2_symbol_to_address["sgg::Granny3D::mModelData"];
+			if (!Lookup || !GetTexture || !mdata_addr)
+			{
+				LOG(ERROR) << "populate_entry_textures: required symbols missing";
+				return 0;
+			}
+
+			sgg::HashGuid guid{};
+			Lookup(&guid, entry.c_str(), entry.size());
+			if (!guid.mId)
+			{
+				LOG(WARNING) << "populate_entry_textures: hash=0 for '" << entry << "'";
+				return 0;
+			}
+
+			uint8_t* mdata = mdata_addr.as<uint8_t*>();
+			void* buckets_ptr = nullptr;
+			uint64_t bucket_count = 0;
+			if (!safe_read_ptr(mdata + 0x08, &buckets_ptr)) return 0;
+			if (!safe_read_u64(mdata + 0x10, &bucket_count)) return 0;
+			if (!buckets_ptr || !bucket_count || bucket_count > 0x100000) return 0;
+
+			uint32_t h = guid.mId;
+			h = ((h >> 16) ^ h) * 0x7feb352d;
+			h = ((h >> 15) ^ h) * 0x846ca68b;
+			h = (h >> 16) ^ h;
+			uint8_t* node = (uint8_t*)((void**)buckets_ptr)[h % bucket_count];
+			int walk_guard = 0;
+			while (node && walk_guard++ < 32)
+			{
+				uint32_t id = 0;
+				if (!safe_read_u32(node, &id)) return 0;
+				if (id == guid.mId) break;
+				void* nxt = nullptr;
+				if (!safe_read_ptr(node + 0xC0, &nxt)) return 0;
+				node = (uint8_t*)nxt;
+			}
+			if (!node || walk_guard >= 32)
+			{
+				LOG(WARNING) << "populate_entry_textures: entry '" << entry << "' not found";
+				return 0;
+			}
+
+			void* vb_p = nullptr; void* ve_p = nullptr;
+			if (!safe_read_ptr(node + 0x10, &vb_p)) return 0;
+			if (!safe_read_ptr(node + 0x18, &ve_p)) return 0;
+			uint8_t* vec_begin = (uint8_t*)vb_p;
+			uint8_t* vec_end   = (uint8_t*)ve_p;
+			size_t mesh_count = (vec_end >= vec_begin) ? (size_t)(vec_end - vec_begin) / 0x50 : 0;
+			if (mesh_count == 0 || mesh_count > 128) return 0;
+
+			int populated = 0;
+			for (size_t i = 0; i < mesh_count; i++)
+			{
+				uint8_t* gmd = vec_begin + i * 0x50;
+
+				uint32_t mesh_type=0, name_hash=0, old_handle=0;
+				safe_read_u32(gmd + 0x4C, &mesh_type);
+				safe_read_u32(gmd + 0x40, &name_hash);
+				safe_read_u32(gmd + 0x44, &old_handle);
+
+				// Game's PrepDraw path only fills GMD+0x44 for type=0 meshes.
+				// Mirror that guard; outlines (type=1) and shadows (type=2)
+				// use different resolution paths and we don't want to touch them.
+				if (mesh_type != 0) continue;
+				if (name_hash == 0) continue;
+
+				uint32_t new_handle = 0;
+				GetTexture(nullptr, &new_handle, name_hash);
+				*(uint32_t*)(gmd + 0x44) = new_handle;
+
+				LOG(INFO) << "populate_entry_textures: '" << entry << "' mesh[" << i << "]"
+				          << " name_hash=" << name_hash
+				          << " handle 0x" << std::hex << old_handle << " -> 0x" << new_handle << std::dec;
+				populated++;
+			}
+			LOG(INFO) << "populate_entry_textures: '" << entry << "' populated " << populated << " handle(s)";
+			return populated;
+		});
+
+		// Lua API: Function
+		// Table: data
+		// Name: swap_to_variant
+		// Param: stock_entry: string: Stock entry name (e.g. "HecateHub_Mesh").
+		// Param: variant_entry: string: Variant entry name loaded in mModelData.
+		// Returns: boolean — true on success.
+		//
+		// One-call atomic outfit switch, matching the engine's own rendering
+		// architecture:
+		//   1. Populate the variant's GMD+0x44 via sgg::GameAssetManager::GetTexture
+		//      (mirrors what ModelAnimation::PrepDraw does for stock entries).
+		//   2. Install a hash remap so draw commands using `stock_entry` get
+		//      redirected to the variant entry at dispatch time.
+		//
+		// Variant textures resolve through the variant's own `GMD+0x40`
+		// (texture name hashes written by AddModelData).  No vcount/topology
+		// constraints; stock state is never mutated.
+		//
+		// **Example Usage:**
+		// ```lua
+		// rom.data.swap_to_variant("HecateHub_Mesh", "Enderclem_HecateBiMod_V0_Mesh")
+		// -- later:
+		// rom.data.restore_stock("HecateHub_Mesh")
+		// ```
+		ns.set_function("swap_to_variant", [](const std::string& stock_entry,
+		                                       const std::string& variant_entry) -> bool {
+			// Just install the hash remap.  Texture handles (GMD+0x44) must be
+			// populated ahead of time via populate_entry_textures at a known-safe
+			// window (first ImGui frame, after LoadAllModelAndAnimationData).
+			// Calling GetTexture from the render-thread ImGui callback while the
+			// game thread is actively rendering the target entry deadlocks the
+			// render pipeline (observed: "Waiting for RenderCommands to be ready
+			// to write").  Keeping this path to a single atomic map write makes
+			// swaps cheap and thread-safe.
+			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+			    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+			if (!Lookup) { LOG(ERROR) << "swap_to_variant: Lookup missing"; return false; }
+
+			sgg::HashGuid variant_guid{};
+			Lookup(&variant_guid, variant_entry.c_str(), variant_entry.size());
+			if (!variant_guid.mId)
+			{
+				LOG(WARNING) << "swap_to_variant: variant hash=0 ('" << variant_entry << "')";
+				return false;
+			}
+			sgg::HashGuid stock_guid{};
+			Lookup(&stock_guid, stock_entry.c_str(), stock_entry.size());
+			if (!stock_guid.mId)
+			{
+				LOG(WARNING) << "swap_to_variant: stock hash=0 ('" << stock_entry << "')";
+				return false;
+			}
+
+			{
+				std::unique_lock l(g_mutex);
+				g_remap[stock_guid.mId] = variant_guid.mId;
+			}
+			update_active_flag();
+
+			LOG(INFO) << "swap_to_variant: '" << stock_entry << "' -> '" << variant_entry << "'";
+			return true;
+		});
+
+		// Lua API: Function
+		// Table: data
+		// Name: restore_stock
+		// Param: stock_entry: string: Stock entry name to revert to.
+		// Returns: boolean — true on success.
+		// Clears any active hash remap for the given stock entry.  No-op if no
+		// remap is active.  Populated variant GMD+0x44 handles are left in place
+		// (they're harmless — only used when a remap is active).
+		ns.set_function("restore_stock", [](const std::string& stock_entry) -> bool {
+			static auto Lookup = *big::hades2_symbol_to_address["sgg::HashGuid::Lookup"]
+			    .as_func<sgg::HashGuid*(sgg::HashGuid*, const char*, size_t)>();
+			sgg::HashGuid stock{};
+			Lookup(&stock, stock_entry.c_str(), stock_entry.size());
+			if (!stock.mId)
+			{
+				LOG(WARNING) << "restore_stock: hash=0 ('" << stock_entry << "')";
+				return false;
+			}
+			{
+				std::unique_lock l(g_mutex);
+				g_remap.erase(stock.mId);
+			}
+			update_active_flag();
+			LOG(INFO) << "restore_stock: '" << stock_entry << "' remap cleared";
+			return true;
+		});
 
 		// NOTE: No hook on LoadAllModelAndAnimationData — a second detour
 		// are loaded automatically by the game when add_granny_file exposes

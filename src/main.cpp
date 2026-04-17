@@ -1275,6 +1275,28 @@ static void sgg__GUIComponentTextBox__GUIComponentTextBox_dctor(GUIComponentText
 	g_GUIComponentTextBoxes.erase(this_);
 }
 
+// SEH-protected read of the button's text lines.
+// Returns success/failure; writes line pointers into out vectors.
+// Must be plain C (no C++ objects) to allow __try.
+static bool safe_read_button_text_lines(GUIComponentButton *btn,
+                                         GUIComponentTextBox_Line **out_begin,
+                                         GUIComponentTextBox_Line **out_end)
+{
+	__try
+	{
+		if (!btn) return false;
+		GUIComponentTextBox *text = btn->mTextBox;
+		if (!text) return false;
+		*out_begin = text->mLines.mpBegin;
+		*out_end   = text->mLines.mpEnd;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
 static void hook_GUIComponentButton_OnSelected(GUIComponentButton *this_, GUIComponentTextBox *prevSelection)
 {
 	std::scoped_lock l(big::lua_manager_extension::g_manager_mutex);
@@ -1283,11 +1305,25 @@ static void hook_GUIComponentButton_OnSelected(GUIComponentButton *this_, GUICom
 
 	g_currently_selected_gui_comp = this_;
 
-	auto gui_button = g_currently_selected_gui_comp;
-	auto gui_text   = gui_button->mTextBox;
+	// Safely read the button's text lines.  Survives game updates that
+	// shift the GUIComponentButton struct layout (mTextBox offset changes).
+	GUIComponentTextBox_Line *line_begin = nullptr;
+	GUIComponentTextBox_Line *line_end   = nullptr;
+	if (!safe_read_button_text_lines(g_currently_selected_gui_comp, &line_begin, &line_end))
+	{
+		static bool logged = false;
+		if (!logged)
+		{
+			logged = true;
+			LOG(WARNING) << "hook_GUIComponentButton_OnSelected: could not read mTextBox — "
+			             << "GUIComponentButton struct layout likely shifted. "
+			             << "Hover callbacks disabled until offsets re-verified.";
+		}
+		return;
+	}
 
 	std::vector<std::string> lines;
-	for (auto i = gui_text->mLines.mpBegin; i < gui_text->mLines.mpEnd; i++)
+	for (auto i = line_begin; i < line_end; i++)
 	{
 		if (i->mText.size())
 		{
@@ -2339,6 +2375,58 @@ extern "C" __declspec(dllexport) void my_main()
 			{
 				big::hooking::detour_hook_helper::add_queue<hook_sgg_HashGuid_Lookup>("sgg::HashGuid::Lookup", ptr);
 			}
+		}
+	}
+
+	// CG3H: raise the static vertex + index pool sizes.  Mods that add
+	// extra mesh entries (e.g. outfit variants) blow through the default
+	// budgets, causing RequestBufferUpdate to fail on later-loaded meshes
+	// (weapons, enemies) → temp/placeholder models.
+	//
+	// Must run before ForgeRenderer init fires at game startup.  my_main()
+	// runs at DLL attach — safely before that.
+	{
+		// Vertex pool: per-shader-effect.  Default 64 MB (0x04000000).
+		// sgg::addShaderEffect calls sgg::addStaticVertexBuffers with size
+		// pushed as the 5th arg via `mov qword [rsp+0x20], imm32`.
+		// Patch 64 MB -> 128 MB.
+		auto v_scan = gmAddress::scan(
+		    "48 C7 44 24 20 00 00 00 04 E8",
+		    "mov [rsp+0x20], 64MB (vertex pool size in sgg::addShaderEffect)");
+		if (v_scan)
+		{
+			auto imm_hi = v_scan.offset(8).as<uint8_t *>();
+			if (*imm_hi == 0x04)
+			{
+				ForceWrite<uint8_t>(*imm_hi, 0x08);
+				LOG(INFO) << "CG3H: raised static vertex pool from 64 MB to 128 MB";
+			}
+		}
+		else
+		{
+			LOG(WARNING) << "CG3H: could not find vertex pool patch site";
+		}
+
+		// Index pool: single global buffer (sgg::gStaticIndexBuffers).
+		// Default 32 MB (0x02000000).  Allocated once inside
+		// sgg::addStaticVertexBuffers via `mov qword [rsp+0x40], imm32`
+		// (gated by null-check against gStaticIndexBuffers).
+		// Patch 32 MB -> 64 MB.
+		auto i_scan = gmAddress::scan(
+		    "48 C7 44 24 40 00 00 00 02 48",
+		    "mov [rsp+0x40], 32MB (index pool size in sgg::addStaticVertexBuffers)");
+		if (i_scan)
+		{
+			auto imm_hi = i_scan.offset(8).as<uint8_t *>();
+			if (*imm_hi == 0x02)
+			{
+				ForceWrite<uint8_t>(*imm_hi, 0x04);
+				LOG(INFO) << "CG3H: raised static index pool from 32 MB to 64 MB";
+			}
+		}
+		else
+		{
+			LOG(WARNING) << "CG3H: could not find index pool patch site";
 		}
 	}
 
