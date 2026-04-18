@@ -1,0 +1,7 @@
+{
+  "name": "Enderclem-Hell2ModdingCG3H",
+  "version_number": "3.9.0",
+  "website_url": "https://github.com/Enderclem0/Hell2Modding/tree/cg3h/v3.9.0",
+  "description": "Temporary fork of Hell2Modding with CG3H v3.9 patches. DLL-only; this stub satisfies H2M's plugin-dependency check.",
+  "dependencies": []
+}

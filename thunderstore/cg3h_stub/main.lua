@@ -1,0 +1,2 @@
+-- Intentional no-op.  The real payload of this mod is d3d12.dll in Ship/.
+-- This file exists only so H2M's plugin-dependency check finds the folder.

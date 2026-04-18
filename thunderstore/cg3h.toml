@@ -21,6 +21,14 @@ outdir = "./build-cg3h"
 source = "../d3d12.dll"
 target = "./ReturnOfModdingPack/d3d12.dll"
 
+# Stub plugin folder so H2M's lua_manager.hpp dependency check can resolve
+# `Enderclem-Hell2ModdingCG3H` on disk.  Without this, any mod that declares
+# us as a dependency (CG3HBuilder, third-party CG3H mods) gets rejected
+# with: "Can't load X because it's missing Enderclem-Hell2ModdingCG3H".
+[[build.copy]]
+source = "./cg3h_stub"
+target = "./plugins/Enderclem-Hell2ModdingCG3H"
+
 [publish]
 repository = "https://thunderstore.io"
 communities = ["hades-ii"]
