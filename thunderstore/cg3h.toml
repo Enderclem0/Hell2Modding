@@ -1,0 +1,27 @@
+
+[config]
+schemaVersion = "0.0.1"
+
+[package]
+namespace = "Enderclem"
+name = "Hell2ModdingCG3H"
+versionNumber = "3.9.0"
+description = "Temporary fork of Hell2Modding with the CG3H v3.9 draw-path bindings (set_mesh_visible, swap_to_variant, populate_entry_textures, restore_stock, dump_pool_stats, sanity_check_gmd) and the static-pool size patches (vertex 64 -> 128 MB, index 32 -> 64 MB). Will be deprecated and deleted once upstream Hell2Modding merges the related PR. Use upstream instead when available."
+websiteUrl = "https://github.com/Enderclem0/Hell2Modding/tree/cg3h/v3.9.0"
+containsNsfwContent = false
+
+[package.dependencies]
+
+[build]
+icon = "./icon.png"
+readme = "./cg3h_README.md"
+outdir = "./build-cg3h"
+
+[[build.copy]]
+source = "../d3d12.dll"
+target = "./ReturnOfModdingPack/d3d12.dll"
+
+[publish]
+repository = "https://thunderstore.io"
+communities = ["hades-ii"]
+categories = ["libraries"]
