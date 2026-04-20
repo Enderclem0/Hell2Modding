@@ -6,7 +6,7 @@ schemaVersion = "0.0.1"
 namespace = "Enderclem"
 name = "Hell2ModdingCG3H"
 versionNumber = "3.9.0"
-description = "Temporary fork of Hell2Modding with the CG3H v3.9 draw-path bindings (set_mesh_visible, swap_to_variant, populate_entry_textures, restore_stock, dump_pool_stats, sanity_check_gmd) and the static-pool size patches (vertex 64 -> 128 MB, index 32 -> 64 MB). Will be deprecated and deleted once upstream Hell2Modding merges the related PR. Use upstream instead when available."
+description = "Temporary fork of Hell2Modding adding the CG3H v3.9 draw-path Lua bindings and static-pool size patches (vertex 64->128 MB, index 32->64 MB). Dependency of CG3HBuilder. Will be removed once the upstream Hell2Modding PR merges."
 websiteUrl = "https://github.com/Enderclem0/Hell2Modding/tree/cg3h/v3.9.0"
 containsNsfwContent = false
 
